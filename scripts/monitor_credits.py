@@ -80,10 +80,15 @@ def load_sessions(db_path):
 def load_generations(traces_dir):
     """
     扫描全部 trace 文件，提取 generation span。
-    返回: {session_id: [ {model, prompt, comp, created}, ... ]} 及未关联统计
+    过滤规则：toolOutput 为空 / 解析失败 / model 缺失且 0 token 的"半完成"调用全部丢弃
+    （它们代表流式被取消/正在运行的调用，无实际 token 消耗，会污染模型汇总）。
+    返回: {session_id: [ {model, prompt, comp, created}, ... ]}
+           unlinked (未关联 sessionId 的统计)
+           dropped (丢弃调用数，按原因)
     """
     per_session = defaultdict(list)
     unlinked = {"files": 0, "generations": 0, "calls": 0, "prompt": 0, "comp": 0}
+    dropped = {"cancelled": 0, "no_model_no_tok": 0, "parse_fail": 0, "empty_out": 0}
     files = glob.glob(os.path.join(traces_dir, "*", "trace_*.json"))
     for f in files:
         try:
@@ -95,28 +100,47 @@ def load_generations(traces_dir):
         for span in d.get("spans", []):
             if span.get("type") != "generation":
                 continue
+            out = span.get("toolOutput")
+            if not out:
+                # 完整空 = streaming 被取消 / 仍在跑，无任何可用信息
+                dropped["empty_out"] += 1
+                continue
             try:
-                out = json.loads(span.get("toolOutput") or "[]")
-                item = out[0] if isinstance(out, list) and out else {}
-                model = item.get("model") or "unknown"
-                u = item.get("usage") or {}
-                rec = {
-                    "model": model,
-                    "prompt": u.get("prompt_tokens", 0) or 0,
-                    "comp": u.get("completion_tokens", 0) or 0,
-                    "created": item.get("created"),
-                }
+                arr = json.loads(out)
             except Exception:
-                rec = {"model": "unknown", "prompt": 0, "comp": 0, "created": None}
+                dropped["parse_fail"] += 1
+                continue
+            if not isinstance(arr, list) or not arr:
+                dropped["parse_fail"] += 1
+                continue
+            item = arr[0]
+            if not isinstance(item, dict):
+                dropped["parse_fail"] += 1
+                continue
+            model = item.get("model")
+            u = item.get("usage") or {}
+            prompt = u.get("prompt_tokens", 0) or 0
+            comp = u.get("completion_tokens", 0) or 0
+            created = item.get("created")
+            # 防御：model 缺失 + 0 token → 丢弃（无法归因到任何模型，且无 token 可统计）
+            if not model and prompt == 0 and comp == 0:
+                dropped["no_model_no_tok"] += 1
+                continue
+            rec = {
+                "model": model or "unknown",   # 极少兜底分支
+                "prompt": prompt,
+                "comp": comp,
+                "created": created,
+            }
             if sid:
                 per_session[sid].append(rec)
             else:
                 unlinked["files"] += 1
                 unlinked["generations"] += 1
                 unlinked["calls"] += 1
-                unlinked["prompt"] += rec["prompt"]
-                unlinked["comp"] += rec["comp"]
-    return per_session, unlinked
+                unlinked["prompt"] += prompt
+                unlinked["comp"] += comp
+    return per_session, unlinked, dropped
 
 
 def load_request_times(audit_dir):
@@ -247,50 +271,59 @@ def fmt_credits(v):
 
 # ---------------- HTML 渲染 ----------------
 
-def build_html(sessions, model_agg, unlinked, report_date, out_path, db_path):
+def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db_path):
     total_credits = sum(s["credits_total"] for s in sessions.values())
     total_today = sum(s["today_new_credits"] for s in sessions.values())
     total_calls = sum(m["calls"] for m in model_agg.values())
     total_prompt = sum(m["prompt"] for m in model_agg.values())
     total_comp = sum(m["comp"] for m in model_agg.values())
+    total_tokens = (total_prompt + total_comp) * 1e6
+    tokens_per_credit = round(total_tokens / total_credits) if total_credits > 0 else 0
     covered = sum(1 for s in sessions.values() if s["traces_covered"])
     multi = [s for s in sessions.values() if s["has_multi_model"]]
+    total_dropped = sum(dropped.values())
 
-    # 模型汇总表行
+    # 模型汇总表行（按 total token 降序——token 为主线）
     model_rows = ""
-    for model, m in sorted(model_agg.items(), key=lambda x: -x[1]["calls"]):
+    for model, m in sorted(model_agg.items(), key=lambda x: -(x[1]["prompt"] + x[1]["comp"])):
+        model_total_m = m["prompt"] + m["comp"]
+        model_total = model_total_m * 1e6
+        share = model_total / total_tokens * 100 if total_tokens > 0 else 0
         model_rows += f"""
         <tr>
           <td><code>{model}</code></td>
           <td>{m['calls']:,}</td>
           <td>{m['prompt']:,.3f}M</td>
           <td>{m['comp']:,.3f}M</td>
-          <td>{m['sessions']}</td>
+          <td><b>{model_total_m:,.2f}M</b></td>
+          <td>{share:.1f}%</td>
           <td>{fmt_credits(m['est_credits'])}</td>
           <td>{m['tokens_per_credit']:,}</td>
         </tr>"""
 
-    # 会话卡片
+    # 会话卡片（按 token 消耗降序——token 为主线）
     cards = ""
-    for sid, s in sorted(sessions.items(), key=lambda x: -x[1]["credits_total"]):
+    for sid, s in sorted(sessions.items(), key=lambda x: -sum((m["prompt"] + m["comp"]) * 1e6 for m in x[1]["models"].values())):
         badge_multi = '<span class="badge badge-multi">★ 模型自动切换</span>' if s["has_multi_model"] else ""
         badge_trace = '<span class="badge badge-trace">traces 已覆盖</span>' if s["traces_covered"] else '<span class="badge badge-weak">traces 未覆盖(仅积分)</span>'
 
-        # 模型明细表
+        # 模型明细表（按 token 降序）
         model_detail = ""
-        for model, m in sorted(s["models"].items(), key=lambda x: -x[1]["calls"]):
+        for model, m in sorted(s["models"].items(), key=lambda x: -(x[1]["prompt"] + x[1]["comp"])):
+            model_total_m = m["prompt"] + m["comp"]
             model_detail += f"""
             <tr>
               <td><code>{model}</code></td>
               <td>{m['calls']:,}</td>
               <td>{m['prompt']:,.3f}M</td>
               <td>{m['comp']:,.3f}M</td>
+              <td><b>{model_total_m:,.2f}M</b></td>
               <td>{fmt_ts_s(m['first'])}</td>
               <td>{fmt_ts_s(m['last'])}</td>
               <td>{fmt_credits(m.get('est_credits', 0))}</td>
             </tr>"""
         if not s["models"]:
-            model_detail = '<tr><td colspan="7" class="muted">无 trace 数据（会话已不在 traces 保留窗口内）</td></tr>'
+            model_detail = '<tr><td colspan="8" class="muted">无 trace 数据（会话已不在 traces 保留窗口内）</td></tr>'
 
         # 时间线（最近 20 条，其余折叠）
         tl = s["timeline"]
@@ -338,7 +371,7 @@ def build_html(sessions, model_agg, unlinked, report_date, out_path, db_path):
         est_ratio = round(tokens_total / s["credits_total"]) if s["credits_total"] > 0 and tokens_total > 0 else 0
 
         cards += f"""
-        <div class="hcard" data-credits="{s['credits_total']}">
+        <div class="hcard" data-tokens="{tokens_total}">
           <div class="card-head">
             <h3>{s['title']}</h3>
             <div class="badges">{badge_multi}{badge_trace}</div>
@@ -350,15 +383,16 @@ def build_html(sessions, model_agg, unlinked, report_date, out_path, db_path):
             <span>活跃: {fmt_ts(s['last_activity_at'])}</span>
           </div>
           <div class="stat-row">
-            <div class="stat"><div class="num">{fmt_credits(s['credits_total'])}</div><div class="lbl">积分合计</div></div>
+            <div class="stat stat-primary"><div class="num">{tokens_total:,.0f}</div><div class="lbl">tokens(精确)</div></div>
+            <div class="stat"><div class="num">{sum(m['calls'] for m in s['models'].values()):,}</div><div class="lbl">LLM 调用</div></div>
             <div class="stat"><div class="num">{len(s['credits'])}</div><div class="lbl">计费请求</div></div>
-            <div class="stat"><div class="num">{tokens_total:,.0f}</div><div class="lbl">tokens(精确)</div></div>
-            <div class="stat"><div class="num">{est_ratio:,}</div><div class="lbl">tokens/积分</div></div>
+            <div class="stat"><div class="num">{fmt_credits(s['credits_total'])}</div><div class="lbl">积分合计</div></div>
+            <div class="stat"><div class="num">{est_ratio:,}</div><div class="lbl">tokens / 积分</div></div>
             <div class="stat"><div class="num">{fmt_credits(s['today_new_credits'])}</div><div class="lbl">今日新增积分</div></div>
           </div>
-          <h4>模型使用明细（按模型）</h4>
+          <h4>模型使用明细（按 token 降序）</h4>
           <table class="tbl">
-            <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>首次调用</th><th>末次调用</th><th>估算积分</th></tr></thead>
+            <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>首次调用</th><th>末次调用</th><th>估算积分</th></tr></thead>
             <tbody>{model_detail}</tbody>
           </table>
           {tl_block}
@@ -371,14 +405,23 @@ def build_html(sessions, model_agg, unlinked, report_date, out_path, db_path):
 
     unlinked_note = ""
     if unlinked["generations"] > 0:
-        unlinked_note = f'<div class="note">ℹ️ {unlinked["generations"]:,} 次调用（{unlinked["prompt"]/1e6:.1f}M prompt / {unlinked["comp"]/1e6:.1f}M comp tokens）来自早期未关联 sessionId 的 trace，未计入会话统计。</div>'
+        unlinked_note = f'<div class="note">ℹ️ <b>{unlinked["generations"]:,}</b> 次 LLM 调用（{unlinked["prompt"]/1e6:.1f}M prompt / {unlinked["comp"]/1e6:.1f}M comp tokens）来自早期未关联 sessionId 的 trace，未能归到任何会话。</div>'
+
+    dropped_note = ""
+    if total_dropped > 0:
+        reasons = []
+        if dropped.get("empty_out"): reasons.append(f'streaming 中断/取消 <b>{dropped["empty_out"]}</b> 次')
+        if dropped.get("no_model_no_tok"): reasons.append(f'模型未知且 0 token <b>{dropped["no_model_no_tok"]}</b> 次')
+        if dropped.get("parse_fail"): reasons.append(f'response 解析失败 <b>{dropped["parse_fail"]}</b> 次')
+        reason_text = "、".join(reasons) if reasons else f'<b>{total_dropped}</b> 次'
+        dropped_note = f'<div class="note muted-note">🗑️ 已丢弃的零产出调用（{reason_text}）：未产生 token、无法归因模型，<b>不计入任何模型/会话统计</b>，仅作为数据完整性提示。</div>'
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WorkBuddy 积分消耗监控报告 · {report_date}</title>
+<title>WorkBuddy Token 消耗 & 积分反推 · {report_date}</title>
 <style>
 :root {{
   --blue: #1a56db; --blue2: #e8f0fe; --bg: #f7f8fa; --ink: #1f2328;
@@ -400,6 +443,11 @@ h4 {{ font-size: 13px; margin: 14px 0 6px; color: #374151; }}
 .ov {{ background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }}
 .ov .num {{ font-size: 22px; font-weight: 700; color: var(--blue); }}
 .ov .lbl {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
+.ov-primary {{ background: #e8f0fe; border-color: #b9d2f8; }}
+.ov-primary .num {{ color: #0b3d91; font-size: 26px; }}
+.ov-primary .lbl {{ color: #1e3a8a; font-weight: 600; }}
+.ov-secondary {{ background: #fafafa; border-style: dashed; }}
+.ov-secondary .num {{ color: var(--muted); font-size: 19px; }}
 .tbl {{ width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; font-size: 13px; }}
 .tbl th {{ background: #f3f4f6; text-align: left; padding: 8px 10px; font-weight: 600; }}
 .tbl td {{ padding: 7px 10px; border-top: 1px solid var(--line); }}
@@ -417,6 +465,10 @@ code {{ background: #f3f4f6; padding: 1px 6px; border-radius: 4px; font-size: 12
 .stat {{ background: var(--bg); border-radius: 8px; padding: 10px; text-align: center; }}
 .stat .num {{ font-size: 17px; font-weight: 700; }}
 .stat .lbl {{ font-size: 11px; color: var(--muted); }}
+.stat-primary {{ background: #e8f0fe; }}
+.stat-primary .num {{ color: #0b3d91; font-size: 20px; }}
+.stat-primary .lbl {{ color: #1e3a8a; font-weight: 600; }}
+.muted-note {{ background: #fafafa; border-color: #e5e7eb; color: var(--muted); font-size: 12px; }}
 .timeline-detail {{ margin-top: 12px; }}
 .timeline-detail summary {{ cursor: pointer; font-size: 13px; color: var(--blue); }}
 .note {{ background: #e6f4ff; border: 1px solid #91caff; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin: 12px 0; }}
@@ -444,29 +496,30 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
 </div>
 
 <div class="wrap">
-  <h1>WorkBuddy 积分消耗监控报告 <span style="font-weight:400;color:var(--muted);font-size:15px">· {report_date}</span></h1>
-  <div class="note">积分来自 <code>workbuddy.db/session_usage.credit_json</code>（精确）；token 与模型来自 <code>traces</code> generation 调用记录（精确）；<b>模型估算积分为按 token 占比分摊的估算值</b>。数据源详见 <code>references/schema.md</code>。</div>
+  <h1>WorkBuddy Token 消耗 & 积分反推 <span style="font-weight:400;color:var(--muted);font-size:15px">· {report_date}</span></h1>
+  <div class="note">WorkBuddy UI 只向你展示 <b>积分消耗</b>。本报告以 <b>token 消耗为主线</b>（精确，来自 traces generation 调用记录），把积分按 token 占比分摊到各会话×模型作为反推参照——帮你看清「为这些积分实际消耗了多少 token」。详见 <code>references/schema.md</code>。</div>
 
   <h2>总览</h2>
   <div class="overview">
-    <div class="ov"><div class="num">{fmt_credits(total_credits)}</div><div class="lbl">总积分</div></div>
-    <div class="ov"><div class="num">{fmt_credits(total_today)}</div><div class="lbl">今日新增积分</div></div>
+    <div class="ov ov-primary"><div class="num">{total_prompt + total_comp:,.2f}M</div><div class="lbl">总 token（精确）</div></div>
     <div class="ov"><div class="num">{total_calls:,}</div><div class="lbl">LLM 调用次数</div></div>
-    <div class="ov"><div class="num">{total_prompt:,.2f}M</div><div class="lbl">prompt tokens</div></div>
-    <div class="ov"><div class="num">{total_comp:,.2f}M</div><div class="lbl">completion tokens</div></div>
     <div class="ov"><div class="num">{len(sessions)}</div><div class="lbl">会话数（traces 覆盖 {covered}）</div></div>
     <div class="ov"><div class="num">{len(model_agg)}</div><div class="lbl">使用模型种类</div></div>
+    <div class="ov ov-secondary"><div class="num">{fmt_credits(total_credits)}</div><div class="lbl">积分合计（来源 DB）</div></div>
+    <div class="ov"><div class="num">{fmt_credits(total_today)}</div><div class="lbl">今日新增积分</div></div>
+    <div class="ov"><div class="num">{tokens_per_credit:,}</div><div class="lbl">tokens / 积分（全局）</div></div>
   </div>
   {multi_notes}
   {unlinked_note}
+  {dropped_note}
 
-  <h2>模型使用汇总（token 精确 · 积分为估算）</h2>
+  <h2>模型 token 消耗汇总（精确 · 按 token 降序）</h2>
   <table class="tbl">
-    <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>涉及会话</th><th>估算积分</th><th>tokens/积分</th></tr></thead>
+    <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>占比</th><th>估算积分</th><th>tokens / 积分</th></tr></thead>
     <tbody>{model_rows}</tbody>
   </table>
 
-  <h2>会话明细（按积分降序）</h2>
+  <h2>会话明细（按 token 降序）</h2>
   {cards}
   <div class="footer">由 credits-monitor skill 生成 · 打开报告即可检索、高亮、批注（存储于浏览器本地）</div>
 </div>
@@ -627,7 +680,7 @@ def main():
     sessions = load_sessions(args.db)
 
     print(f"[2/4] 扫描 traces 调用记录: {args.traces}")
-    per_session, unlinked = load_generations(args.traces)
+    per_session, unlinked, dropped = load_generations(args.traces)
 
     print(f"[3/4] 构建 requestId→时间索引（audit-log）")
     request_times = load_request_times(args.audit)
@@ -639,7 +692,7 @@ def main():
     latest_path = os.path.join(args.out, "credits_latest.html")
 
     print(f"[4/4] 渲染报告")
-    build_html(sessions, model_agg, unlinked, report_date, out_path, args.db)
+    build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, args.db)
 
     # 副本
     with open(out_path, encoding="utf-8") as f:
