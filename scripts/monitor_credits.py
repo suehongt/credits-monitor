@@ -357,7 +357,10 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
     total_prompt = sum(m["prompt"] for m in model_agg.values())
     total_comp = sum(m["comp"] for m in model_agg.values())
     total_tokens = (total_prompt + total_comp) * 1e6
-    tokens_per_credit = round(total_tokens / total_credits) if total_credits > 0 else 0
+    # 全局比值：分子分母口径必须对齐——只用 traces 覆盖会话的积分做分母
+    # （未覆盖会话有积分但无 token，混入会稀释/拉低比值）
+    covered_credits = sum(s["credits_total"] for s in sessions.values() if s["traces_covered"])
+    tokens_per_credit = round(total_tokens / covered_credits) if covered_credits > 0 else 0
     covered = sum(1 for s in sessions.values() if s["traces_covered"])
     total_dropped = sum(dropped.values())
 
@@ -640,7 +643,7 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
     <div class="ov"><div class="num">{len(model_agg)}</div><div class="lbl">使用模型种类</div></div>
     <div class="ov ov-secondary"><div class="num">{fmt_credits(total_credits)}</div><div class="lbl">积分消耗合计（仅 LLM 调用扣除）</div></div>
     <div class="ov"><div class="num">{fmt_credits(total_today)}</div><div class="lbl">今日积分消耗</div></div>
-    <div class="ov"><div class="num">{tokens_per_credit:,}</div><div class="lbl">1 积分 ≈ ? token（全局）</div></div>
+    <div class="ov"><div class="num">{tokens_per_credit:,}</div><div class="lbl">1 积分 ≈ ? token（仅覆盖会话，混合平均）</div></div>
   </div>
   {multi_notes}
   {unlinked_note}
