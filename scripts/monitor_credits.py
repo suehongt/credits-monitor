@@ -203,7 +203,7 @@ def load_request_times(audit_dir):
 
 # ---------------- 统计与估算 ----------------
 
-def merge_data(sessions, per_session, request_times, today_ts_ms):
+def merge_data(sessions, per_session, request_times, today_ts_ms, today_start_ms):
     """把 traces 的 generation 并入会话，按 会话x模型x来源 聚合，估算积分分摊"""
     for sid, recs in sessions.items():
         gens = per_session.get(sid, [])
@@ -272,11 +272,11 @@ def merge_data(sessions, per_session, request_times, today_ts_ms):
             for model, m in agg.items():
                 m["est_credits"] = 0.0
 
-        # 今日积分消耗（requestId 时间戳在今天的 credit 合计）
+        # 今日积分消耗（requestId 时间戳在“本地自然日 00:00:00 ~ 现在”区间内的 credit 合计；非滚动24h）
         today_new = 0.0
         for rid, cr in sessions[sid]["credits"].items():
             ts = request_times.get(rid)
-            if ts and today_ts_ms - 86400000 < ts <= today_ts_ms:
+            if ts and today_start_ms <= ts <= today_ts_ms:
                 today_new += cr
         sessions[sid]["today_new_credits"] = round(today_new, 2)
 
@@ -559,7 +559,7 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
             <div class="stat"><div class="num">{len(s['credits'])}</div><div class="lbl">计费请求</div></div>
             <div class="stat"><div class="num">{fmt_credits(s['credits_total'])}</div><div class="lbl">积分消耗（仅扣除）</div></div>
             <div class="stat"><div class="num">{est_ratio:,}</div><div class="lbl">该会话：每 1 积分 ≈ ? token</div></div>
-            <div class="stat"><div class="num">{fmt_credits(s['today_new_credits'])}</div><div class="lbl">今日积分消耗</div></div>
+            <div class="stat"><div class="num">{fmt_credits(s['today_new_credits'])}</div><div class="lbl">今日积分(00:00起)</div></div>
           </div>
           <h4>模型使用明细（按 token 降序；来源: 主=主对话 子=Agent工具派生的子代理 后=系统后台代理）</h4>
           <div class="tbl-wrap">
@@ -692,7 +692,7 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
     <div class="ov"><div class="num">{len(sessions)}</div><div class="lbl">会话数（traces 覆盖 {covered}）</div></div>
     <div class="ov"><div class="num">{len(model_agg)}</div><div class="lbl">使用模型种类</div></div>
     <div class="ov ov-secondary"><div class="num">{fmt_credits(total_credits)}</div><div class="lbl">积分消耗合计（仅 LLM 调用扣除）</div></div>
-    <div class="ov"><div class="num">{fmt_credits(total_today)}</div><div class="lbl">今日积分消耗</div></div>
+    <div class="ov"><div class="num">{fmt_credits(total_today)}</div><div class="lbl">今日积分(自然日00:00起)</div></div>
     <div class="ov"><div class="num">{tokens_per_credit:,}</div><div class="lbl">1 积分 ≈ ? token（仅覆盖会话，混合平均）</div></div>
   </div>
   {multi_notes}
@@ -871,6 +871,8 @@ def main():
     report_date = today.isoformat()
     now = datetime.datetime.now()
     today_ts_ms = int(now.timestamp() * 1000)
+    # 今日起点（本地时区 00:00:00），用于“今日积分”按自然日而非滚动 24h 统计
+    today_start_ms = int(datetime.datetime.combine(today, datetime.time.min).timestamp() * 1000)
 
     print(f"[1/4] 读取会话与积分: {args.db}")
     sessions = load_sessions(args.db)
@@ -881,7 +883,7 @@ def main():
     print(f"[3/4] 构建 requestId→时间索引（audit-log）")
     request_times = load_request_times(args.audit)
 
-    sessions, model_agg = merge_data(sessions, per_session, request_times, today_ts_ms)
+    sessions, model_agg = merge_data(sessions, per_session, request_times, today_ts_ms, today_start_ms)
 
     os.makedirs(args.out, exist_ok=True)
     out_path = os.path.join(args.out, f"credits_{report_date}.html")
