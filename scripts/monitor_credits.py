@@ -509,7 +509,7 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
             <div class="stat stat-primary"><div class="num">{tokens_total:,.0f}</div><div class="lbl">tokens(精确)</div></div>
             <div class="stat"><div class="num">{sum(m['calls'] for m in s['models'].values()):,}</div><div class="lbl">LLM 调用</div></div>
             <div class="stat"><div class="num">{len(s['credits'])}</div><div class="lbl">计费请求</div></div>
-            <div class="stat"><div class="num">{fmt_credits(s['credits_total'])}</div><div class="lbl">积分合计</div></div>
+            <div class="stat"><div class="num">{fmt_credits(s['credits_total'])}</div><div class="lbl">积分消耗（仅扣除）</div></div>
             <div class="stat"><div class="num">{est_ratio:,}</div><div class="lbl">tokens / 积分</div></div>
             <div class="stat"><div class="num">{fmt_credits(s['today_new_credits'])}</div><div class="lbl">今日新增积分</div></div>
           </div>
@@ -629,6 +629,8 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
 <div class="wrap">
   <h1>WorkBuddy Token 消耗 & 积分反推 <span style="font-weight:400;color:var(--muted);font-size:15px">· {report_date}</span></h1>
   <div class="note">WorkBuddy UI 只向你展示 <b>积分消耗</b>。本报告以 <b>token 消耗为主线</b>（精确，来自 traces generation 调用记录），把积分按 token 占比分摊到各会话×模型作为反推参照——帮你看清「为这些积分实际消耗了多少 token」。每次调用按来源标注：<b>主对话</b> / <b>子代理</b>（Agent 工具派生，使用独立模型）/ <b>后台代理</b>（系统压缩/摘要等）。本地数据不记录模型切换事件，主对话多模型<b>无法区分手动/自动切换</b>。详见 <code>references/schema.md</code>。</div>
+  <div class="note muted-note">⚠️ <b>关于积分数字</b>：本报告的"积分消耗" = <code>session_usage.credit_json</code> 之和，<b>仅含 LLM 调用扣除的积分</b>，不含签到 / 邀约 / 任务 / 退款等正向流入（这些只存在 workbuddy.cn 服务端，本地拿不到）。<br>
+  &nbsp;&nbsp;&nbsp;<b>UI 余额 = 起始余额 + 期间获得 − 期间消耗</b>，所以本报告数字与 UI 余额之差 = 期间获得的积分。</div>
 
   <h2>总览</h2>
   <div class="overview">
@@ -636,7 +638,7 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
     <div class="ov"><div class="num">{total_calls:,}</div><div class="lbl">LLM 调用次数</div></div>
     <div class="ov"><div class="num">{len(sessions)}</div><div class="lbl">会话数（traces 覆盖 {covered}）</div></div>
     <div class="ov"><div class="num">{len(model_agg)}</div><div class="lbl">使用模型种类</div></div>
-    <div class="ov ov-secondary"><div class="num">{fmt_credits(total_credits)}</div><div class="lbl">积分合计（来源 DB）</div></div>
+    <div class="ov ov-secondary"><div class="num">{fmt_credits(total_credits)}</div><div class="lbl">积分消耗合计（仅 LLM 调用扣除）</div></div>
     <div class="ov"><div class="num">{fmt_credits(total_today)}</div><div class="lbl">今日新增积分</div></div>
     <div class="ov"><div class="num">{tokens_per_credit:,}</div><div class="lbl">tokens / 积分（全局）</div></div>
   </div>
@@ -841,7 +843,7 @@ def main():
     print(f"\n✅ 报告已生成:")
     print(f"   {out_path}")
     print(f"   {latest_path}")
-    print(f"\n汇总: 会话 {len(sessions)} 个 | 总积分 {sum(s['credits_total'] for s in sessions.values()):.2f} | "
+    print(f"\n汇总: 会话 {len(sessions)} 个 | 积分消耗(仅扣除) {sum(s['credits_total'] for s in sessions.values()):.2f} | "
           f"LLM 调用 {sum(m['calls'] for m in model_agg.values()):,} 次 | "
           f"prompt {sum(m['prompt'] for m in model_agg.values()):.2f}M / comp {sum(m['comp'] for m in model_agg.values()):.2f}M tokens")
 
