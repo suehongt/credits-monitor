@@ -280,10 +280,11 @@ def merge_data(sessions, per_session, request_times, today_ts_ms):
                 today_new += cr
         sessions[sid]["today_new_credits"] = round(today_new, 2)
 
-    # 模型全局汇总（含来源拆分）
+    # 模型全局汇总（含来源拆分 + 时间窗口）
     model_agg = defaultdict(lambda: {
         "calls": 0, "prompt": 0, "comp": 0, "est_credits": 0.0, "sessions": set(),
         "calls_main": 0, "tok_main": 0, "calls_sub": 0, "tok_sub": 0, "calls_bg": 0, "tok_bg": 0,
+        "first_ts": None, "last_ts": None, "active_secs": 0,  # 时间窗口 + 各会话内部活跃秒数
     })
     for sid, s in sessions.items():
         for model, m in s["models"].items():
@@ -298,6 +299,15 @@ def merge_data(sessions, per_session, request_times, today_ts_ms):
                                            ("background", "calls_bg", "tok_bg")]:
                 a[k_calls] += m[k_calls]
                 a[k_tok] += m[k_tok]
+            # 时间窗口：跨会话的 first/last + 该会话内此模型活跃秒数
+            if m.get("first") is not None:
+                if a["first_ts"] is None or m["first"] < a["first_ts"]:
+                    a["first_ts"] = m["first"]
+            if m.get("last") is not None:
+                if a["last_ts"] is None or m["last"] > a["last_ts"]:
+                    a["last_ts"] = m["last"]
+            if m.get("first") is not None and m.get("last") is not None:
+                a["active_secs"] += max(0, m["last"] - m["first"])
     for m in model_agg.values():
         m["sessions"] = len(m["sessions"])
         m["prompt"] = round(m["prompt"], 3)
@@ -310,6 +320,22 @@ def merge_data(sessions, per_session, request_times, today_ts_ms):
         m["tokens_per_credit"] = round(toks / m["est_credits"]) if m["est_credits"] > 0 else 0
 
     return sessions, model_agg
+
+
+def fmt_duration(secs):
+    """把秒数压成短人类可读：< 1分 → 'Ns秒'; < 1时 → 'N分钟'; < 1天 → 'N小时 M分钟'; 否则 'N天 M小时'"""
+    if secs is None or secs <= 0:
+        return "-"
+    s = int(secs)
+    if s < 60:
+        return f"{s}秒"
+    if s < 3600:
+        return f"{s//60}分{s%60}秒" if s%60 else f"{s//60}分钟"
+    h, rem = divmod(s, 3600)
+    if h < 24:
+        return f"{h}小时{rem//60}分" if rem >= 60 else f"{h}小时"
+    d, rem = divmod(s, 86400)
+    return f"{d}天{rem//3600}小时" if rem >= 3600 else f"{d}天"
 
 
 def fmt_source_split(m):
@@ -371,6 +397,8 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
         model_total_m = m["prompt"] + m["comp"]
         model_total = model_total_m * 1e6
         share = model_total / total_tokens * 100 if total_tokens > 0 else 0
+        span_secs = (m["last_ts"] - m["first_ts"]) if (m["first_ts"] and m["last_ts"]) else None
+        avg_kh = (model_total / 1e3) / (span_secs / 3600) if span_secs and span_secs > 0 else 0
         token_rows += f"""
         <tr>
           <td><code>{model}</code></td>
@@ -380,6 +408,11 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
           <td><b>{model_total_m:,.2f}M</b></td>
           <td>{share:.1f}%</td>
           <td>{fmt_source_split(m)}</td>
+          <td>{fmt_ts_s(m['first_ts']) if m['first_ts'] else '-'}</td>
+          <td>{fmt_ts_s(m['last_ts']) if m['last_ts'] else '-'}</td>
+          <td>{fmt_duration(span_secs)}</td>
+          <td>{fmt_duration(m['active_secs'])}</td>
+          <td>{avg_kh:,.0f}</td>
         </tr>"""
     # 积分反推表按估算积分降序（哪模型"贵"看这张）
     for model, m in sorted(model_agg.items(), key=lambda x: -x[1]["est_credits"]):
@@ -651,7 +684,7 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
 
   <h2>模型 token 消耗（精确）</h2>
   <table class="tbl">
-    <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>占比</th><th>来源拆分（主=主对话 子=子代理 后=后台代理）</th></tr></thead>
+    <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>占比</th><th>来源拆分</th><th>首次</th><th>末次</th><th>总跨度</th><th>活跃时长</th><th>k tokens/时（峰值估算）</th></tr></thead>
     <tbody>{token_rows}</tbody>
   </table>
 
