@@ -471,6 +471,28 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
         tokens_total = sum((m["prompt"] + m["comp"]) * 1e6 for m in s["models"].values())
         est_ratio = round(tokens_total / s["credits_total"]) if s["credits_total"] > 0 and tokens_total > 0 else 0
 
+        # 主对话模型时间轴（压缩连续段）：直接回答"什么时候从模型A切到模型B"
+        main_tl = [(ts, model) for ts, model, pr, co, src in s["timeline"] if src == "main"]
+        main_runs = []
+        for ts, model in main_tl:
+            if main_runs and main_runs[-1][0] == model:
+                main_runs[-1][2] += 1
+            else:
+                main_runs.append([model, ts, 1])
+        if len(main_runs) > 1:
+            run_items = " → ".join(
+                f"{fmt_ts_s(t)} <code>{m}</code>×{n}" for m, t, n in main_runs
+            )
+            main_tl_block = f"""
+          <div class="main-model-tl">
+            <b>主对话模型切换时间轴</b>（共 {len(main_runs)} 段；切换原因不记录，无法区分手动/自动/auto 兜底）：<br>{run_items}
+          </div>"""
+        elif len(main_runs) == 1:
+            main_tl_block = f"""
+          <div class="main-model-tl"><b>主对话模型</b>：全程 <code>{main_runs[0][0]}</code>（无切换）</div>"""
+        else:
+            main_tl_block = ""
+
         cards += f"""
         <div class="hcard" data-tokens="{tokens_total}">
           <div class="card-head">
@@ -496,6 +518,7 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
             <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>来源拆分</th><th>首次调用</th><th>末次调用</th><th>估算积分</th></tr></thead>
             <tbody>{model_detail}</tbody>
           </table>
+          {main_tl_block}
           {tl_block}
         </div>"""
 
@@ -578,6 +601,7 @@ code {{ background: #f3f4f6; padding: 1px 6px; border-radius: 4px; font-size: 12
 .muted-note {{ background: #fafafa; border-color: #e5e7eb; color: var(--muted); font-size: 12px; }}
 .timeline-detail {{ margin-top: 12px; }}
 .timeline-detail summary {{ cursor: pointer; font-size: 13px; color: var(--blue); }}
+.main-model-tl {{ background: #f6f8ff; border: 1px dashed #b9d2f8; border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 12.5px; line-height: 1.8; }}
 .note {{ background: #e6f4ff; border: 1px solid #91caff; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin: 12px 0; }}
 .note.warn {{ background: #fff1f0; border-color: #ffccc7; }}
 .muted {{ color: var(--muted); }}
