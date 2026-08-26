@@ -43,12 +43,15 @@
 ### trace 顶层
 ```json
 {
-  "trace": { "traceId": "...", "sessionId": "会话UUID", "startedAt": "...", "totalTokens": 0 },
+  "trace": { "traceId": "...", "sessionId": "会话UUID", "startedAt": "...", "totalTokens": 0,
+             "modelInfo": {"models": ["glm-5.3"], "totalInputTokens": 373208, "totalOutputTokens": 4064, "totalCachedTokens": ...} },
   "spans": [...]
 }
 ```
 - `trace.sessionId`：**关联会话的关键**（早期约 54% trace 无此字段）
 - `trace.totalTokens` 常为 0，不可用；真实 token 在 generation span 中
+- `trace.modelInfo.models`：**本次请求实际用到的模型数组**（约 102/216 覆盖，新格式 trace 才有）；
+  可与 generation 明细交叉验证。`modelInfo` 不区分主对话/子代理，按 span 父链分类更精确
 
 ### generation span（type == "generation"）—— 每次 LLM 调用
 ```json
@@ -58,13 +61,23 @@
   "toolOutput": "[{\"id\":\"msg_id\",\"created\":1787707220,\"model\":\"deepseek-v4-flash\",
      \"usage\":{\"prompt_tokens\":38657,\"completion_tokens\":853,
        \"prompt_tokens_details\":{\"cached_tokens\":0,\"reasoning_tokens\":0},
-       \"completion_tokens_details\":{\"reasoning_tokens\":654}}} ]"
+       \"completion_tokens_details\":{\"reasoning_tokens":654}}} ]"
 }
 ```
-- `toolOutput[0].model`：**本次调用实际模型**（可发现 kimi-k3-1 / kimi-k3-2 / hy3-x / glm-5.3 等切换）
+- `toolOutput[0].model`：**本次调用实际模型**——UI 显示 "auto" 时系统实际选的模型就在这里（含主对话/子代理每次调用）
 - `toolOutput[0].usage`：**精确 token**（prompt/completion，含缓存/推理明细）
 - `toolOutput[0].created`：Unix 秒时间戳
+- `toolInput` 为消息数组（系统提示词首行 "This conversation is powered by XXX" 亦标注当前模型）
 - 一个 agent 回合可含多个 generation（多轮工具调用）
+- **调用来源分类**（按父 span 链）：父链含 `function:Agent` → 子代理；父链含非 `cli` 的 agent span（contextSummary/contentAnalyzer 等）→ 后台代理；否则 → 主对话
+
+### span 父链示例
+```
+主对话:     generation ← agent:cli
+子代理:     generation ← agent:general-purpose ← function:Agent ← agent:cli
+后台代理:   generation ← agent:contextSummary ← agent:cli
+```
+注意：同一会话的 generation 与其父 agent span 可能分布在**不同 trace 文件**中，追父链需跨文件建全局 spanId 索引。
 
 ## 3. audit-log 目录 `~/.workbuddy/audit-log/YYYY-MM-DD*.jsonl`（时间补充）
 
@@ -81,9 +94,11 @@
 | 会话×模型 token/次数/时间 | traces generation（sessionId → model/usage/created 分组） | 精确 |
 | 会话×模型积分 | 按 token 占比分摊会话积分（`est_credits`） | **估算**（本地无 requestId↔generation 关联键） |
 | 今日新增积分 | audit-log 匹配 requestId 时间戳，筛今天 | 仅覆盖有审计事件的请求 |
-| 会话当前模型 | sessions.model | 不可信（中途切换） |
+| 会话当前模型 | sessions.model | 记录"实际解析后的当前模型"（= 主对话最后一次调用的模型，已验证一致）；**不记录用户选择的是哪个模型** |
 
 ## 5. 已知限制
-- traces 只保留近期活跃会话（约 7/10 会话有记录），历史会话无法按模型拆分，报告标"traces 未覆盖(仅积分)"
+- traces 只保留近期活跃会话（约 7/12 会话有记录），历史会话无法按模型拆分，报告标"traces 未覆盖(仅积分)"
 - 早期 trace 无 sessionId（约 98 个文件），其 generation 归入"未关联"并在报告中提示
 - 模型估算积分基于"定价∝token"假设，实际受模型等级/思考模式/缓存影响，仅作参考
+- **模型切换来源不可分**：本地无 UI 事件日志，主对话多模型无法区分用户手动切换 / 系统自动切换 / auto 模式兜底；`sessions.model` 与 traces 均只记实际模型，不记"requested model"
+- 来源分类依赖父 span 链完整；父链断裂时默认归"主对话"
