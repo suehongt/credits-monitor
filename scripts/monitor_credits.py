@@ -283,13 +283,14 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
     multi = [s for s in sessions.values() if s["has_multi_model"]]
     total_dropped = sum(dropped.values())
 
-    # 模型汇总表行（按 total token 降序——token 为主线）
-    model_rows = ""
+    # 拆成两张表：纯 token 主表 + 积分反推次表——单一职责避免混淆
+    token_rows = ""
+    credit_rows = ""
     for model, m in sorted(model_agg.items(), key=lambda x: -(x[1]["prompt"] + x[1]["comp"])):
         model_total_m = m["prompt"] + m["comp"]
         model_total = model_total_m * 1e6
         share = model_total / total_tokens * 100 if total_tokens > 0 else 0
-        model_rows += f"""
+        token_rows += f"""
         <tr>
           <td><code>{model}</code></td>
           <td>{m['calls']:,}</td>
@@ -297,8 +298,19 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
           <td>{m['comp']:,.3f}M</td>
           <td><b>{model_total_m:,.2f}M</b></td>
           <td>{share:.1f}%</td>
-          <td>{fmt_credits(m['est_credits'])}</td>
+        </tr>"""
+    # 积分反推表按估算积分降序（哪模型"贵"看这张）
+    for model, m in sorted(model_agg.items(), key=lambda x: -x[1]["est_credits"]):
+        model_total_m = m["prompt"] + m["comp"]
+        model_total = model_total_m * 1e6
+        share = model_total / total_tokens * 100 if total_tokens > 0 else 0
+        credit_rows += f"""
+        <tr>
+          <td><code>{model}</code></td>
+          <td><b>{fmt_credits(m['est_credits'])}</b></td>
+          <td>{share:.1f}%</td>
           <td>{m['tokens_per_credit']:,}</td>
+          <td>{model_total_m:,.2f}M</td>
         </tr>"""
 
     # 会话卡片（按 token 消耗降序——token 为主线）
@@ -513,10 +525,17 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
   {unlinked_note}
   {dropped_note}
 
-  <h2>模型 token 消耗汇总（精确 · 按 token 降序）</h2>
+  <h2>模型 token 消耗（精确）</h2>
   <table class="tbl">
-    <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>占比</th><th>估算积分</th><th>tokens / 积分</th></tr></thead>
-    <tbody>{model_rows}</tbody>
+    <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>占比</th></tr></thead>
+    <tbody>{token_rows}</tbody>
+  </table>
+
+  <h2>积分反推（按 token 占比分摊估算）</h2>
+  <div class="note muted-note">以下积分是按会话总积分 × 模型 token 占比分摊的<b>估算值</b>，用于回答"为这些 token 实际花了多少积分"。仅在 traces 覆盖的会话范围内计算。</div>
+  <table class="tbl">
+    <thead><tr><th>模型</th><th>估算积分</th><th>占 token 总数</th><th>tokens / 积分（每花 1 积分换到的 token）</th><th>对应 token</th></tr></thead>
+    <tbody>{credit_rows}</tbody>
   </table>
 
   <h2>会话明细（按 token 降序）</h2>
