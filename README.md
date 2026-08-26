@@ -44,10 +44,10 @@ WorkBuddy 的 `sessions.model` 字段只记录会话**当前**所使用的模型
 
 ```bash
 # 用户级（推荐，跨项目可用）
-git clone https://github.com/Sunchen122/credits-monitor.git ~/.workbuddy/skills/credits-monitor
+git clone https://github.com/suehongt/credits-monitor.git ~/.workbuddy/skills/credits-monitor
 
 # 或项目级（仅当前项目）
-git clone https://github.com/Sunchen122/credits-monitor.git <项目>/.workbuddy/skills/credits-monitor
+git clone https://github.com/suehongt/credits-monitor.git <项目>/.workbuddy/skills/credits-monitor
 ```
 
 之后在对话中说「看积分报告」「运行 credits-monitor」「监控每个会话的 token 消耗」等即可触发。
