@@ -370,6 +370,16 @@ def fmt_ts_s(ts_s):
         return "-"
 
 
+def fmt_ts_short(ts_s):
+    """表格内紧凑时间戳：MM-DD HH:MM（省年份和秒，防溢出）"""
+    if not ts_s:
+        return "-"
+    try:
+        return datetime.datetime.fromtimestamp(ts_s).strftime("%m-%d %H:%M")
+    except Exception:
+        return "-"
+
+
 def fmt_credits(v):
     return f"{v:.2f}"
 
@@ -408,8 +418,8 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
           <td><b>{model_total_m:,.2f}M</b></td>
           <td>{share:.1f}%</td>
           <td>{fmt_source_split(m)}</td>
-          <td>{fmt_ts_s(m['first_ts']) if m['first_ts'] else '-'}</td>
-          <td>{fmt_ts_s(m['last_ts']) if m['last_ts'] else '-'}</td>
+          <td>{fmt_ts_short(m['first_ts']) if m['first_ts'] else '-'}</td>
+          <td>{fmt_ts_short(m['last_ts']) if m['last_ts'] else '-'}</td>
           <td>{fmt_duration(span_secs)}</td>
           <td>{fmt_duration(m['active_secs'])}</td>
           <td>{avg_kh:,.0f}</td>
@@ -452,8 +462,8 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
               <td>{m['comp']:,.3f}M</td>
               <td><b>{model_total_m:,.2f}M</b></td>
               <td>{fmt_source_split(m)}</td>
-              <td>{fmt_ts_s(m['first'])}</td>
-              <td>{fmt_ts_s(m['last'])}</td>
+              <td>{fmt_ts_short(m['first'])}</td>
+              <td>{fmt_ts_short(m['last'])}</td>
               <td>{fmt_credits(m.get('est_credits', 0))}</td>
             </tr>"""
         if not s["models"]:
@@ -467,7 +477,7 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
         for ts, model, pr, co, src in tl_latest:
             tl_rows += f"""
             <tr>
-              <td>{fmt_ts_s(ts)}</td>
+              <td>{fmt_ts_short(ts)}</td>
               <td>{src_label.get(src, '?')}</td>
               <td><code>{model}</code></td>
               <td>{pr:,}</td>
@@ -478,7 +488,7 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
             for ts, model, pr, co, src in tl[:-20]:
                 hidden_rows += f"""
                 <tr>
-                  <td>{fmt_ts_s(ts)}</td>
+                  <td>{fmt_ts_short(ts)}</td>
                   <td>{src_label.get(src, '?')}</td>
                   <td><code>{model}</code></td>
                   <td>{pr:,}</td>
@@ -550,10 +560,12 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
             <div class="stat"><div class="num">{fmt_credits(s['today_new_credits'])}</div><div class="lbl">今日积分消耗</div></div>
           </div>
           <h4>模型使用明细（按 token 降序；来源: 主=主对话 子=Agent工具派生的子代理 后=系统后台代理）</h4>
-          <table class="tbl">
-            <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>来源拆分</th><th>首次调用</th><th>末次调用</th><th>估算积分</th></tr></thead>
+          <div class="tbl-wrap">
+          <table class="tbl tbl-wide">
+            <thead><tr><th>模型</th><th>调用</th><th>prompt</th><th>completion</th><th>合计</th><th>来源拆分</th><th>首次</th><th>末次</th><th>估算积分</th></tr></thead>
             <tbody>{model_detail}</tbody>
           </table>
+          </div>
           {main_tl_block}
           {tl_block}
         </div>"""
@@ -614,6 +626,8 @@ h4 {{ font-size: 13px; margin: 14px 0 6px; color: #374151; }}
 .ov-secondary {{ background: #fafafa; border-style: dashed; }}
 .ov-secondary .num {{ color: var(--muted); font-size: 19px; }}
 .tbl {{ width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; font-size: 13px; }}
+.tbl-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 8px; }}
+.tbl-wide {{ min-width: 980px; font-size: 12px; white-space: nowrap; }}
 .tbl th {{ background: #f3f4f6; text-align: left; padding: 8px 10px; font-weight: 600; }}
 .tbl td {{ padding: 7px 10px; border-top: 1px solid var(--line); }}
 .tbl tr:hover td {{ background: #f9fafb; }}
@@ -683,10 +697,13 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
   {dropped_note}
 
   <h2>模型 token 消耗（精确）</h2>
-  <table class="tbl">
-    <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>占比</th><th>来源拆分</th><th>首次</th><th>末次</th><th>总跨度</th><th>活跃时长</th><th>k tokens/时（峰值估算）</th></tr></thead>
+  <div class="tbl-wrap">
+  <table class="tbl tbl-wide">
+    <thead><tr><th>模型</th><th>调用</th><th>prompt</th><th>completion</th><th>合计</th><th>占比</th><th>来源拆分</th><th>首次</th><th>末次</th><th>总跨度</th><th>活跃时长</th><th>k tok/时</th></tr></thead>
     <tbody>{token_rows}</tbody>
   </table>
+  </div>
+  <div class="note muted-note">「k tok/时」= 千 token/小时（合计 ÷ 总跨度），衡量烧钱速度——短时高值为爆发型，长时低值为背景型；「活跃时长」= 各会话内（末次−首次）之和；「来源拆分」主=主对话 子=子代理 后=后台代理。</div>
 
   <h2>积分反推（按 token 占比分摊估算）</h2>
   <div class="note muted-note">以下积分是按会话总积分 × 模型 token 占比分摊的<b>估算值</b>，用于回答"为这些 token 实际花了多少积分"。仅在 traces 覆盖的会话范围内计算。</div>
