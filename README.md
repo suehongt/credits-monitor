@@ -1,9 +1,8 @@
 # Credits Monitor · WorkBuddy Token 消耗 & 积分反推
 
-> 从 WorkBuddy 本地数据反推每个会话 × 每个模型的**精确 token 消耗**，
+> 从 WorkBuddy 本地数据反推每个会话 × 每个模型 × 调用来源（主对话/子代理/后台代理）的**精确 token 消耗**，
 > 并把 WorkBuddy UI 展示的**积分消耗**作为反推参照——看清「为这些积分实际消耗了多少 token」。
-> 同时检测会话中途的**模型自动切换**（如 `kimi-k3` 变 `auto`、`hy3-x` 与其他模型混用），
-> 输出一份可交互的 HTML 报告。
+> 识别会话内的多模型混用并区分混用来源，输出一份可交互的 HTML 报告。
 
 [English docs below](#english)
 
@@ -14,16 +13,23 @@
 WorkBuddy UI 只向你展示**积分消耗**，不展示 token 数量。但 LLM 的真实工作单元是 token——
 你想知道"为这些积分实际消耗了多少 token、按什么模型消耗的"。
 
-同时，WorkBuddy 的 `sessions.model` 字段只记录会话**当前**所使用的模型，**中途会自动切换模型**（有实证），
-因此该字段不可信。本 skill 通过 `traces/` 目录中**每次 LLM 调用**的原始记录，还原真实的模型使用分布，
-例如同一个会话同时混用了 `hy3-x`、`kimi-k3-1`、`kimi-k3-2` 三种模型。
+同时，`sessions.model` 只记录会话**当前**模型；一个会话实际可能调用过多个模型，UI 不展示。
+本 skill 通过 `traces/` 中**每次 LLM 调用**的原始记录还原真实的模型使用分布，并按父 span 链
+把每次调用分类为：
+
+- **主对话** —— 你直接对话的调用
+- **子代理** —— Agent 工具派生的子任务（使用独立模型，UI 完全不显示这部分）
+- **后台代理** —— 系统后台任务（上下文压缩/摘要等）
+
+**口径说明**：本地数据不记录模型切换事件，主对话调用过多个模型时**无法区分用户手动切换与
+系统自动切换**——报告如实标注这一点，不做"偷偷换模型"之类的断言。
 
 核心价值：
 
-- **每个会话 × 每个模型**的调用次数、prompt / completion tokens、首末时间 → 精确（来自 traces）
+- **每个会话 × 每个模型 × 来源**的调用次数、prompt / completion tokens、首末时间 → 精确（来自 traces）
 - **会话级积分消耗**（`credit_json`）→ 精确（来自 workbuddy.db）
 - **积分 ↔ token 换算** → 按 token 占比分摊的**估算值**
-- **模型自动切换检测**：报告中用 ★ 标注发生切换的会话
+- **多模型混用识别**（区分"主对话多模型"与"子代理引入的模型"）
 - 一份自带全局检索 / 高亮批注 / 回到顶部的交互式 HTML 报告
 
 ---
@@ -32,10 +38,10 @@ WorkBuddy UI 只向你展示**积分消耗**，不展示 token 数量。但 LLM 
 
 | 数据 | 来源 | 精度 | 在报告中 |
 |---|---|---|---|
-| 会话×模型 token / 次数 / 时间 | `~/.workbuddy/traces/*/trace_*.json` → generation span | **精确**（主指标） | 模型表 + 会话明细表 |
+| 会话×模型×来源 token / 次数 / 时间 | `~/.workbuddy/traces/*/trace_*.json` → generation span + 父链分类 | **精确**（主指标） | 模型表 + 会话明细表 |
 | 会话级积分 | `~/.workbuddy/workbuddy.db` → `session_usage.credit_json` | 精确 | overview 卡片 + 估算列 |
 | 会话×模型积分 | 按 token 占比分摊 | **估算** | 「估算积分」列（明确标 "估算"） |
-| 会话元信息 | `sessions` 表（标题 / 状态 / 创建时间） | 精确（但 `model` 字段不可信） | 卡片头部 |
+| 会话元信息 | `sessions` 表（标题 / 状态 / 创建时间） | 精确（`model` 字段仅当前模型） | 卡片头部 |
 | 今日新增积分 | `audit-log/*.jsonl` 匹配 requestId 时间戳 | 覆盖有审计事件的请求 | 卡片「今日新增积分」列 |
 
 > **数据处理**：流式被取消 / 仍在运行的零产出调用自动丢弃，不计入任何模型 / 会话统计，
@@ -103,11 +109,12 @@ python3 scripts/monitor_credits.py --out <输出目录>
 2. **模型自动切换提示** —— 列出发生切换的会话
 3. **未关联调用提示** —— 早期无 sessionId 的 trace 统计
 4. **已丢弃的零产出调用** —— 流式被取消等无法归因的调用数
-5. **模型 token 消耗汇总** —— 按合计 token 降序，含占比、估算积分、tokens/积分
-6. **会话明细** —— 按合计 token 降序的卡片，每张卡片含：
+5. **模型 token 消耗汇总** —— 按合计 token 降序，含占比、来源拆分（主/子代理/后台）
+6. **积分反推表** —— 按估算积分降序：模型、估算积分、tokens/积分
+7. **会话明细** —— 按合计 token 降序的卡片，每张卡片含：
    - tokens(精确) 置顶 | LLM 调用 | 计费请求 | 积分合计 | tokens/积分 | 今日新增积分
-   - 模型使用明细表（按 token 降序，含首次/末次调用时间）
-   - 调用时间线（最近 20 次 + 折叠历史）
+   - 模型使用明细表（按 token 降序，含来源拆分、首次/末次调用时间）
+   - 调用时间线（最近 20 次 + 折叠历史，每条含来源标记：主/子/后）
 
 **交互能力**
 
@@ -121,11 +128,13 @@ python3 scripts/monitor_credits.py --out <输出目录>
 
 ## ⚠️ 已知限制
 
-- **traces 仅保留近期活跃会话**（当前约 7/11 会话有记录）；无 traces 的会话在报告中标「traces 未覆盖（仅积分）」，无法按模型拆分。
+- **traces 仅保留近期活跃会话**（当前约 7/12 会话有记录）；无 traces 的会话在报告中标「traces 未覆盖（仅积分）」，无法按模型拆分。
 - **积分按模型为估算值**：本地无 `requestId ↔ generation` 关联键，按 token 占比分摊，受模型等级 / 思考模式 / 缓存影响。
+- **模型切换来源不可分**：主对话多模型无法区分用户手动切换与系统自动切换（本地无切换事件日志）。
 - 早期 trace（约 98 个文件）无 `sessionId`，其调用归入「未关联」并在报告顶部提示。
 - 流式被取消 / 仍在运行的零产出调用被自动丢弃，不计入统计（仅显示数量）。
 - 积分为累计值；「今日新增」仅统计 audit-log 能匹配到时间的计费请求。
+- 来源分类依赖父 span 链完整可追溯；父链断裂时默认归「主对话」。
 
 ---
 
@@ -158,22 +167,25 @@ MIT —— 可自由使用、修改、分发。
 
 ## English
 
-**Credits Monitor** is a WorkBuddy skill that **reconstructs precise per-session × per-model token consumption**
-from local usage data, with **credits consumption** (the only number the WorkBuddy UI shows) as a derived
-reference. It also detects **mid-session model auto-switching** (e.g. `kimi-k3` falling back to `auto`,
-or `hy3-x` mixed with other models).
+**Credits Monitor** is a WorkBuddy skill that **reconstructs precise per-session × per-model × per-source
+token consumption** from local usage data, with **credits consumption** (the only number the WorkBuddy UI
+shows) as a derived reference. Every LLM call is classified by its parent-span chain into **main
+conversation**, **subagent** (spawned via the Agent tool, using its own model — invisible in the UI),
+or **background agent** (system tasks like context summarization).
 
 WorkBuddy's UI exposes only credit charges. This skill tells you "how many tokens did those credits buy,
-and which models were used." WorkBuddy's `sessions.model` only records the *current* model and silently
-switches mid-conversation, so it is unreliable — we reconstruct the true model distribution from raw
-LLM-call logs in `traces/`.
+which models were used, and whether the calls came from your main conversation or from subagents."
+
+**Honest scoping**: local data records no model-switch events, so when the main conversation used multiple
+models, the tool **cannot distinguish user-initiated switches from system auto-switches** — the report
+states this explicitly rather than claiming "sneaky switching."
 
 **Highlights**
 
-- Per-session × per-model call count, prompt/completion tokens, and timestamps — **exact**
+- Per-session × per-model × per-source call count, prompt/completion tokens, and timestamps — **exact**
 - Per-session credits — **exact**
 - Credits ↔ token conversion — **estimated** (token-share allocation)
-- Model auto-switch detection (★ badge in the report)
+- Multi-model detection with source attribution (main vs. subagent vs. background)
 - Interactive HTML report (global search, highlight + annotate, back-to-top)
 - Dropped-call tracking: streaming cancellations and zero-output calls are filtered out and reported separately
 

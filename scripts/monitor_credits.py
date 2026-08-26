@@ -77,32 +77,69 @@ def load_sessions(db_path):
     return sessions
 
 
+def classify_source(span, spans_by_id):
+    """
+    按父 span 链判断 generation 调用来源：
+      main       —— 主对话（父链只有 agent:cli）
+      subagent   —— 用户通过 Agent 工具派生的子代理（父链含 function:Agent）
+      background —— 系统后台代理（contextSummary / contentAnalyzer 等，父链含非 cli 的 agent span）
+    注意：spans_by_id 必须是跨文件的全局索引——同一会话的 generation 与其父 agent span
+    可能分布在不同的 trace 文件中（每个 trace 文件对应一次用户请求）。
+    """
+    cur = span.get("parentId")
+    has_agent_tool = False   # 父链含 function:Agent（用户派生的子代理）
+    has_bg_agent = False     # 父链含非 cli 的 agent span（系统后台代理）
+    for _ in range(12):
+        if not cur or cur not in spans_by_id:
+            break
+        ps = spans_by_id[cur]
+        if ps.get("type") == "function" and ps.get("name") == "Agent":
+            has_agent_tool = True
+        elif ps.get("type") == "agent" and ps.get("name") not in ("cli",):
+            has_bg_agent = True
+        cur = ps.get("parentId")
+    if has_agent_tool:
+        return "subagent"
+    if has_bg_agent:
+        return "background"
+    return "main"
+
+
 def load_generations(traces_dir):
     """
-    扫描全部 trace 文件，提取 generation span。
-    过滤规则：toolOutput 为空 / 解析失败 / model 缺失且 0 token 的"半完成"调用全部丢弃
-    （它们代表流式被取消/正在运行的调用，无实际 token 消耗，会污染模型汇总）。
-    返回: {session_id: [ {model, prompt, comp, created}, ... ]}
-           unlinked (未关联 sessionId 的统计)
-           dropped (丢弃调用数，按原因)
+    扫描全部 trace 文件，提取 generation span，并分类调用来源（main / subagent / background）。
+    两遍扫描：第一遍建全局 span 索引（spanId 在全库唯一，跨文件追父链），
+    第二遍提取 generation 并分类。
+    过滤规则：toolOutput 为空 / 解析失败 / model 缺失且 0 token 的"半完成"调用全部丢弃。
     """
     per_session = defaultdict(list)
     unlinked = {"files": 0, "generations": 0, "calls": 0, "prompt": 0, "comp": 0}
     dropped = {"cancelled": 0, "no_model_no_tok": 0, "parse_fail": 0, "empty_out": 0}
     files = glob.glob(os.path.join(traces_dir, "*", "trace_*.json"))
+
+    # 第一遍：全局 span 索引
+    global_spans = {}
+    parsed_files = []
     for f in files:
         try:
             with open(f, encoding="utf-8") as fh:
                 d = json.load(fh)
         except Exception:
             continue
+        parsed_files.append(d)
+        for s in d.get("spans", []):
+            sid = s.get("spanId")
+            if sid and sid not in global_spans:
+                global_spans[sid] = s
+
+    # 第二遍：提取 generation 并分类
+    for d in parsed_files:
         sid = d.get("trace", {}).get("sessionId")
         for span in d.get("spans", []):
             if span.get("type") != "generation":
                 continue
             out = span.get("toolOutput")
             if not out:
-                # 完整空 = streaming 被取消 / 仍在跑，无任何可用信息
                 dropped["empty_out"] += 1
                 continue
             try:
@@ -110,27 +147,24 @@ def load_generations(traces_dir):
             except Exception:
                 dropped["parse_fail"] += 1
                 continue
-            if not isinstance(arr, list) or not arr:
+            if not isinstance(arr, list) or not arr or not isinstance(arr[0], dict):
                 dropped["parse_fail"] += 1
                 continue
             item = arr[0]
-            if not isinstance(item, dict):
-                dropped["parse_fail"] += 1
-                continue
             model = item.get("model")
             u = item.get("usage") or {}
             prompt = u.get("prompt_tokens", 0) or 0
             comp = u.get("completion_tokens", 0) or 0
             created = item.get("created")
-            # 防御：model 缺失 + 0 token → 丢弃（无法归因到任何模型，且无 token 可统计）
             if not model and prompt == 0 and comp == 0:
                 dropped["no_model_no_tok"] += 1
                 continue
             rec = {
-                "model": model or "unknown",   # 极少兜底分支
+                "model": model or "unknown",
                 "prompt": prompt,
                 "comp": comp,
                 "created": created,
+                "source": classify_source(span, global_spans),
             }
             if sid:
                 per_session[sid].append(rec)
@@ -170,18 +204,36 @@ def load_request_times(audit_dir):
 # ---------------- 统计与估算 ----------------
 
 def merge_data(sessions, per_session, request_times, today_ts_ms):
-    """把 traces 的 generation 并入会话，按 会话x模型 聚合，估算积分分摊"""
+    """把 traces 的 generation 并入会话，按 会话x模型x来源 聚合，估算积分分摊"""
     for sid, recs in sessions.items():
         gens = per_session.get(sid, [])
         if gens:
             sessions[sid]["traces_covered"] = True
-        # 按模型聚合
-        agg = defaultdict(lambda: {"calls": 0, "prompt": 0, "comp": 0, "first": None, "last": None})
+        # 按模型×来源聚合
+        agg = defaultdict(lambda: {
+            "calls": 0, "prompt": 0, "comp": 0, "first": None, "last": None,
+            "calls_main": 0, "tok_main": 0,
+            "calls_sub": 0, "tok_sub": 0,
+            "calls_bg": 0, "tok_bg": 0,
+        })
+        main_models = set()
         for g in gens:
             m = agg[g["model"]]
+            src = g.get("source", "main")
             m["calls"] += 1
             m["prompt"] += g["prompt"]
             m["comp"] += g["comp"]
+            tok = g["prompt"] + g["comp"]
+            if src == "main":
+                m["calls_main"] += 1
+                m["tok_main"] += tok
+                main_models.add(g["model"])
+            elif src == "subagent":
+                m["calls_sub"] += 1
+                m["tok_sub"] += tok
+            else:
+                m["calls_bg"] += 1
+                m["tok_bg"] += tok
             ts = g["created"]
             if ts:
                 if m["first"] is None or ts < m["first"]:
@@ -191,18 +243,24 @@ def merge_data(sessions, per_session, request_times, today_ts_ms):
         for model, m in agg.items():
             m["prompt"] = round(m["prompt"] / 1e6, 3)   # 百万 tokens
             m["comp"] = round(m["comp"] / 1e6, 3)
+            m["tok_main"] = round(m["tok_main"] / 1e6, 3)
+            m["tok_sub"] = round(m["tok_sub"] / 1e6, 3)
+            m["tok_bg"] = round(m["tok_bg"] / 1e6, 3)
         sessions[sid]["models"] = dict(agg)
+        sessions[sid]["main_models"] = main_models
 
-        # 时间线：按时间排序
+        # 时间线：按时间排序（含来源标记）
         timeline = sorted(
-            [(g["created"], g["model"], g["prompt"], g["comp"]) for g in gens
+            [(g["created"], g["model"], g["prompt"], g["comp"], g.get("source", "main")) for g in gens
              if g["created"]],
             key=lambda x: x[0],
         )
         sessions[sid]["timeline"] = timeline
 
-        # 多模型标记
+        # 多模型标记（区分：主对话换过模型 vs 仅子代理引入其他模型）
         sessions[sid]["has_multi_model"] = len(agg) > 1
+        sessions[sid]["main_multi"] = len(main_models) > 1
+        sessions[sid]["has_subagent"] = any(m["calls_sub"] > 0 for m in agg.values())
 
         # 积分按 token 占比分摊到模型（估算）
         total_tokens = sum((m["prompt"] + m["comp"]) * 1e6 for m in agg.values())
@@ -222,9 +280,10 @@ def merge_data(sessions, per_session, request_times, today_ts_ms):
                 today_new += cr
         sessions[sid]["today_new_credits"] = round(today_new, 2)
 
-    # 模型全局汇总（仅覆盖 traces 的会话参与；估算积分来自分摊）
+    # 模型全局汇总（含来源拆分）
     model_agg = defaultdict(lambda: {
-        "calls": 0, "prompt": 0, "comp": 0, "est_credits": 0.0, "sessions": set()
+        "calls": 0, "prompt": 0, "comp": 0, "est_credits": 0.0, "sessions": set(),
+        "calls_main": 0, "tok_main": 0, "calls_sub": 0, "tok_sub": 0, "calls_bg": 0, "tok_bg": 0,
     })
     for sid, s in sessions.items():
         for model, m in s["models"].items():
@@ -234,15 +293,35 @@ def merge_data(sessions, per_session, request_times, today_ts_ms):
             a["comp"] += m["comp"]
             a["est_credits"] += m.get("est_credits", 0.0)
             a["sessions"].add(sid)
+            for k_src, k_calls, k_tok in [("main", "calls_main", "tok_main"),
+                                           ("subagent", "calls_sub", "tok_sub"),
+                                           ("background", "calls_bg", "tok_bg")]:
+                a[k_calls] += m[k_calls]
+                a[k_tok] += m[k_tok]
     for m in model_agg.values():
         m["sessions"] = len(m["sessions"])
         m["prompt"] = round(m["prompt"], 3)
         m["comp"] = round(m["comp"], 3)
         m["est_credits"] = round(m["est_credits"], 2)
+        m["tok_main"] = round(m["tok_main"], 3)
+        m["tok_sub"] = round(m["tok_sub"], 3)
+        m["tok_bg"] = round(m["tok_bg"], 3)
         toks = (m["prompt"] + m["comp"]) * 1e6
         m["tokens_per_credit"] = round(toks / m["est_credits"]) if m["est_credits"] > 0 else 0
 
     return sessions, model_agg
+
+
+def fmt_source_split(m):
+    """压缩显示 来源拆分：主 x.xM · 子 x.xM · 后台 x.xM（省略为 0 的部分）"""
+    parts = []
+    if m.get("tok_main", 0) > 0:
+        parts.append(f"主 {m['tok_main']:,.2f}M")
+    if m.get("tok_sub", 0) > 0:
+        parts.append(f"子 {m['tok_sub']:,.2f}M")
+    if m.get("tok_bg", 0) > 0:
+        parts.append(f"后台 {m['tok_bg']:,.2f}M")
+    return " · ".join(parts) if parts else "-"
 
 
 # ---------------- 时间工具 ----------------
@@ -280,7 +359,6 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
     total_tokens = (total_prompt + total_comp) * 1e6
     tokens_per_credit = round(total_tokens / total_credits) if total_credits > 0 else 0
     covered = sum(1 for s in sessions.values() if s["traces_covered"])
-    multi = [s for s in sessions.values() if s["has_multi_model"]]
     total_dropped = sum(dropped.values())
 
     # 拆成两张表：纯 token 主表 + 积分反推次表——单一职责避免混淆
@@ -298,6 +376,7 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
           <td>{m['comp']:,.3f}M</td>
           <td><b>{model_total_m:,.2f}M</b></td>
           <td>{share:.1f}%</td>
+          <td>{fmt_source_split(m)}</td>
         </tr>"""
     # 积分反推表按估算积分降序（哪模型"贵"看这张）
     for model, m in sorted(model_agg.items(), key=lambda x: -x[1]["est_credits"]):
@@ -316,8 +395,14 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
     # 会话卡片（按 token 消耗降序——token 为主线）
     cards = ""
     for sid, s in sorted(sessions.items(), key=lambda x: -sum((m["prompt"] + m["comp"]) * 1e6 for m in x[1]["models"].values())):
-        badge_multi = '<span class="badge badge-multi">★ 模型自动切换</span>' if s["has_multi_model"] else ""
-        badge_trace = '<span class="badge badge-trace">traces 已覆盖</span>' if s["traces_covered"] else '<span class="badge badge-weak">traces 未覆盖(仅积分)</span>'
+        badges = ""
+        if s.get("main_multi"):
+            badges += '<span class="badge badge-multi">★ 主对话多模型（手动/自动不可分）</span>'
+        if s.get("has_subagent"):
+            badges += '<span class="badge badge-sub">子代理调用</span>'
+        if s.get("has_multi_model") and not s.get("main_multi"):
+            badges += '<span class="badge badge-weak">多模型（来自子代理/后台）</span>'
+        badges += '<span class="badge badge-trace">traces 已覆盖</span>' if s["traces_covered"] else '<span class="badge badge-weak">traces 未覆盖(仅积分)</span>'
 
         # 模型明细表（按 token 降序）
         model_detail = ""
@@ -330,49 +415,53 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
               <td>{m['prompt']:,.3f}M</td>
               <td>{m['comp']:,.3f}M</td>
               <td><b>{model_total_m:,.2f}M</b></td>
+              <td>{fmt_source_split(m)}</td>
               <td>{fmt_ts_s(m['first'])}</td>
               <td>{fmt_ts_s(m['last'])}</td>
               <td>{fmt_credits(m.get('est_credits', 0))}</td>
             </tr>"""
         if not s["models"]:
-            model_detail = '<tr><td colspan="8" class="muted">无 trace 数据（会话已不在 traces 保留窗口内）</td></tr>'
+            model_detail = '<tr><td colspan="9" class="muted">无 trace 数据（会话已不在 traces 保留窗口内）</td></tr>'
 
         # 时间线（最近 20 条，其余折叠）
         tl = s["timeline"]
+        src_label = {"main": "主", "subagent": "子", "background": "后"}
         tl_rows = ""
         tl_latest = tl[-20:]
-        for ts, model, pr, co in tl_latest:
+        for ts, model, pr, co, src in tl_latest:
             tl_rows += f"""
             <tr>
               <td>{fmt_ts_s(ts)}</td>
+              <td>{src_label.get(src, '?')}</td>
               <td><code>{model}</code></td>
               <td>{pr:,}</td>
               <td>{co:,}</td>
             </tr>"""
         hidden_rows = ""
         if len(tl) > 20:
-            for ts, model, pr, co in tl[:-20]:
+            for ts, model, pr, co, src in tl[:-20]:
                 hidden_rows += f"""
                 <tr>
                   <td>{fmt_ts_s(ts)}</td>
+                  <td>{src_label.get(src, '?')}</td>
                   <td><code>{model}</code></td>
                   <td>{pr:,}</td>
                   <td>{co:,}</td>
                 </tr>"""
             tl_block = f"""
             <details class="timeline-detail">
-              <summary>调用时间线（共 {len(tl):,} 次，默认显示最近 20 次）</summary>
+              <summary>调用时间线（共 {len(tl):,} 次，默认显示最近 20 次；来源: 主=主对话 子=子代理 后=后台代理）</summary>
               <table class="tbl">
-                <thead><tr><th>时间</th><th>模型</th><th>prompt tokens</th><th>completion tokens</th></tr></thead>
+                <thead><tr><th>时间</th><th>来源</th><th>模型</th><th>prompt tokens</th><th>completion tokens</th></tr></thead>
                 <tbody>{hidden_rows}{tl_rows}</tbody>
               </table>
             </details>"""
         else:
             tl_block = f"""
             <details class="timeline-detail" open>
-              <summary>调用时间线（共 {len(tl):,} 次）</summary>
+              <summary>调用时间线（共 {len(tl):,} 次；来源: 主=主对话 子=子代理 后=后台代理）</summary>
               <table class="tbl">
-                <thead><tr><th>时间</th><th>模型</th><th>prompt tokens</th><th>completion tokens</th></tr></thead>
+                <thead><tr><th>时间</th><th>来源</th><th>模型</th><th>prompt tokens</th><th>completion tokens</th></tr></thead>
                 <tbody>{tl_rows}</tbody>
               </table>
             </details>"""
@@ -386,7 +475,7 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
         <div class="hcard" data-tokens="{tokens_total}">
           <div class="card-head">
             <h3>{s['title']}</h3>
-            <div class="badges">{badge_multi}{badge_trace}</div>
+            <div class="badges">{badges}</div>
           </div>
           <div class="card-meta">
             <span>状态: {s['status']}</span>
@@ -402,18 +491,23 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
             <div class="stat"><div class="num">{est_ratio:,}</div><div class="lbl">tokens / 积分</div></div>
             <div class="stat"><div class="num">{fmt_credits(s['today_new_credits'])}</div><div class="lbl">今日新增积分</div></div>
           </div>
-          <h4>模型使用明细（按 token 降序）</h4>
+          <h4>模型使用明细（按 token 降序；来源: 主=主对话 子=Agent工具派生的子代理 后=系统后台代理）</h4>
           <table class="tbl">
-            <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>首次调用</th><th>末次调用</th><th>估算积分</th></tr></thead>
+            <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>来源拆分</th><th>首次调用</th><th>末次调用</th><th>估算积分</th></tr></thead>
             <tbody>{model_detail}</tbody>
           </table>
           {tl_block}
         </div>"""
 
     multi_notes = ""
-    if multi:
-        items = "、".join(f"「{s['title'][:20]}」" for s in multi)
-        multi_notes = f'<div class="note warn">⚠️ 检测到 <b>{len(multi)}</b> 个会话发生<b>模型中途自动切换</b>：{items}。sessions 表的 model 字段仅记录当前模型，需以 traces 为准。</div>'
+    main_multi_sessions = [s for s in sessions.values() if s.get("main_multi")]
+    sub_only_sessions = [s for s in sessions.values() if s.get("has_multi_model") and not s.get("main_multi")]
+    if main_multi_sessions:
+        items = "、".join(f"「{s['title'][:20]}」" for s in main_multi_sessions)
+        multi_notes = f'<div class="note warn">⚠️ <b>{len(main_multi_sessions)}</b> 个会话的<b>主对话</b>先后调用过多个模型：{items}。<b>注意：本地数据不记录模型切换事件，无法区分是用户手动切换还是系统自动切换</b>（sessions.model 仅记录当前模型）。</div>'
+    if sub_only_sessions:
+        items2 = "、".join(f"「{s['title'][:20]}」" for s in sub_only_sessions)
+        multi_notes += f'<div class="note">ℹ️ 另有 <b>{len(sub_only_sessions)}</b> 个会话的多模型来自<b>子代理/后台代理</b>（Agent 工具派生的子任务使用独立模型）：{items2}。这不代表主对话被切换。</div>'
 
     unlinked_note = ""
     if unlinked["generations"] > 0:
@@ -470,6 +564,7 @@ code {{ background: #f3f4f6; padding: 1px 6px; border-radius: 4px; font-size: 12
 .badges {{ display: flex; gap: 6px; }}
 .badge {{ font-size: 11px; padding: 2px 8px; border-radius: 20px; }}
 .badge-multi {{ background: #fff1f0; color: var(--red); border: 1px solid #ffccc7; }}
+.badge-sub {{ background: #fffbe6; color: #ad6800; border: 1px solid #ffe58f; }}
 .badge-trace {{ background: #e6f4ff; color: #0958d9; border: 1px solid #91caff; }}
 .badge-weak {{ background: #f0f0f0; color: var(--muted); border: 1px solid #d9d9d9; }}
 .card-meta {{ display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: 8px 0 12px; }}
@@ -509,7 +604,7 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
 
 <div class="wrap">
   <h1>WorkBuddy Token 消耗 & 积分反推 <span style="font-weight:400;color:var(--muted);font-size:15px">· {report_date}</span></h1>
-  <div class="note">WorkBuddy UI 只向你展示 <b>积分消耗</b>。本报告以 <b>token 消耗为主线</b>（精确，来自 traces generation 调用记录），把积分按 token 占比分摊到各会话×模型作为反推参照——帮你看清「为这些积分实际消耗了多少 token」。详见 <code>references/schema.md</code>。</div>
+  <div class="note">WorkBuddy UI 只向你展示 <b>积分消耗</b>。本报告以 <b>token 消耗为主线</b>（精确，来自 traces generation 调用记录），把积分按 token 占比分摊到各会话×模型作为反推参照——帮你看清「为这些积分实际消耗了多少 token」。每次调用按来源标注：<b>主对话</b> / <b>子代理</b>（Agent 工具派生，使用独立模型）/ <b>后台代理</b>（系统压缩/摘要等）。本地数据不记录模型切换事件，主对话多模型<b>无法区分手动/自动切换</b>。详见 <code>references/schema.md</code>。</div>
 
   <h2>总览</h2>
   <div class="overview">
@@ -527,7 +622,7 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
 
   <h2>模型 token 消耗（精确）</h2>
   <table class="tbl">
-    <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>占比</th></tr></thead>
+    <thead><tr><th>模型</th><th>调用次数</th><th>prompt tokens</th><th>completion tokens</th><th>合计</th><th>占比</th><th>来源拆分（主=主对话 子=子代理 后=后台代理）</th></tr></thead>
     <tbody>{token_rows}</tbody>
   </table>
 
