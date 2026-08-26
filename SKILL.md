@@ -29,7 +29,7 @@ agent_created: true
 | 会话×模型×来源 token/次数/时间 | `~/.workbuddy/traces/*/trace_*.json` → generation span + 父链分类 | 精确 |
 | 会话元信息 | `sessions` 表 | 精确（model 字段仅当前模型） |
 | 会话×模型积分 | token 占比分摊 | 估算 |
-| 今日新增积分 | `audit-log/*.jsonl` 匹配 requestId 时间戳 | 覆盖有审计事件的请求 |
+| 今日积分消耗 | `audit-log/*.jsonl` 匹配 requestId 时间戳 | 覆盖有审计事件的请求 |
 
 ## 工作流
 
@@ -44,7 +44,7 @@ agent_created: true
    - `<out>/credits_latest.html`（最新副本）
 
 3. **打开报告预览**（用 present_files），并总结关键发现：
-   - 总 token（精确）、总积分、今日新增积分、LLM 调用总次数
+   - 总 token（精确）、积分消耗合计、今日积分消耗、LLM 调用总次数
    - token 消耗 Top 会话与 Top 模型（含来源拆分：主/子代理/后台）
    - 主对话多模型的会话（★ 标注，注明手动/自动不可分）
    - 子代理/后台代理消耗了多少 token（用户通常不知道这部分存在）

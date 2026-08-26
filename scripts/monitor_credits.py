@@ -6,7 +6,7 @@ credits-monitor: WorkBuddy 积分 / token 消耗监控
 数据源（只读）：
   1. ~/.workbuddy/workbuddy.db        -> session_usage(积分 credit_json) + sessions(会话元信息)
   2. ~/.workbuddy/traces/*/trace_*.json -> generation span（每次 LLM 调用: model / usage / created / sessionId）
-  3. ~/.workbuddy/audit-log/*.jsonl    -> requestId -> 时间戳（用于"今日新增积分"统计）
+  3. ~/.workbuddy/audit-log/*.jsonl    -> requestId -> 时间戳（用于"今日积分消耗"统计）
 
 产出：
   <out_dir>/credits_YYYY-MM-DD.html   交互式 HTML 报告（全局检索 / 高亮批注 / 回到顶部 / CONFIG 区）
@@ -272,7 +272,7 @@ def merge_data(sessions, per_session, request_times, today_ts_ms):
             for model, m in agg.items():
                 m["est_credits"] = 0.0
 
-        # 今日新增积分（requestId 时间戳在今天的 credit 合计）
+        # 今日积分消耗（requestId 时间戳在今天的 credit 合计）
         today_new = 0.0
         for rid, cr in sessions[sid]["credits"].items():
             ts = request_times.get(rid)
@@ -510,8 +510,8 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
             <div class="stat"><div class="num">{sum(m['calls'] for m in s['models'].values()):,}</div><div class="lbl">LLM 调用</div></div>
             <div class="stat"><div class="num">{len(s['credits'])}</div><div class="lbl">计费请求</div></div>
             <div class="stat"><div class="num">{fmt_credits(s['credits_total'])}</div><div class="lbl">积分消耗（仅扣除）</div></div>
-            <div class="stat"><div class="num">{est_ratio:,}</div><div class="lbl">tokens / 积分</div></div>
-            <div class="stat"><div class="num">{fmt_credits(s['today_new_credits'])}</div><div class="lbl">今日新增积分</div></div>
+            <div class="stat"><div class="num">{est_ratio:,}</div><div class="lbl">该会话：每 1 积分 ≈ ? token</div></div>
+            <div class="stat"><div class="num">{fmt_credits(s['today_new_credits'])}</div><div class="lbl">今日积分消耗</div></div>
           </div>
           <h4>模型使用明细（按 token 降序；来源: 主=主对话 子=Agent工具派生的子代理 后=系统后台代理）</h4>
           <table class="tbl">
@@ -639,8 +639,8 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
     <div class="ov"><div class="num">{len(sessions)}</div><div class="lbl">会话数（traces 覆盖 {covered}）</div></div>
     <div class="ov"><div class="num">{len(model_agg)}</div><div class="lbl">使用模型种类</div></div>
     <div class="ov ov-secondary"><div class="num">{fmt_credits(total_credits)}</div><div class="lbl">积分消耗合计（仅 LLM 调用扣除）</div></div>
-    <div class="ov"><div class="num">{fmt_credits(total_today)}</div><div class="lbl">今日新增积分</div></div>
-    <div class="ov"><div class="num">{tokens_per_credit:,}</div><div class="lbl">tokens / 积分（全局）</div></div>
+    <div class="ov"><div class="num">{fmt_credits(total_today)}</div><div class="lbl">今日积分消耗</div></div>
+    <div class="ov"><div class="num">{tokens_per_credit:,}</div><div class="lbl">1 积分 ≈ ? token（全局）</div></div>
   </div>
   {multi_notes}
   {unlinked_note}
@@ -655,7 +655,7 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
   <h2>积分反推（按 token 占比分摊估算）</h2>
   <div class="note muted-note">以下积分是按会话总积分 × 模型 token 占比分摊的<b>估算值</b>，用于回答"为这些 token 实际花了多少积分"。仅在 traces 覆盖的会话范围内计算。</div>
   <table class="tbl">
-    <thead><tr><th>模型</th><th>估算积分</th><th>占 token 总数</th><th>tokens / 积分（每花 1 积分换到的 token）</th><th>对应 token</th></tr></thead>
+    <thead><tr><th>模型</th><th>估算积分</th><th>占 token 总数</th><th>每 1 积分 ≈ ? token</th><th>对应 token</th></tr></thead>
     <tbody>{credit_rows}</tbody>
   </table>
 
