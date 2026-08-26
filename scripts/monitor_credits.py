@@ -417,6 +417,8 @@ def build_html(sessions, model_agg, unlinked, dropped, report_date, out_path, db
           <td>{m['comp']:,.3f}M</td>
           <td><b>{model_total_m:,.2f}M</b></td>
           <td>{share:.1f}%</td>
+          <td>{fmt_credits(m['est_credits'])}</td>
+          <td>{m['tokens_per_credit']:,}</td>
           <td>{fmt_source_split(m)}</td>
           <td>{fmt_ts_short(m['first_ts']) if m['first_ts'] else '-'}</td>
           <td>{fmt_ts_short(m['last_ts']) if m['last_ts'] else '-'}</td>
@@ -627,7 +629,8 @@ h4 {{ font-size: 13px; margin: 14px 0 6px; color: #374151; }}
 .ov-secondary .num {{ color: var(--muted); font-size: 19px; }}
 .tbl {{ width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; font-size: 13px; }}
 .tbl-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 8px; }}
-.tbl-wide {{ min-width: 980px; font-size: 12px; white-space: nowrap; }}
+.tbl-wide {{ min-width: 1180px; font-size: 12px; white-space: nowrap; }}
+.tbl-wide th {{ white-space: nowrap; }}
 .tbl th {{ background: #f3f4f6; text-align: left; padding: 8px 10px; font-weight: 600; }}
 .tbl td {{ padding: 7px 10px; border-top: 1px solid var(--line); }}
 .tbl tr:hover td {{ background: #f9fafb; }}
@@ -699,7 +702,7 @@ mark.search-cur {{ background: #FF8C00; color: #fff; }}
   <h2>模型 token 消耗（精确）</h2>
   <div class="tbl-wrap">
   <table class="tbl tbl-wide">
-    <thead><tr><th>模型</th><th>调用</th><th>prompt</th><th>completion</th><th>合计</th><th>占比</th><th>来源拆分</th><th>首次</th><th>末次</th><th>总跨度</th><th>活跃时长</th><th>k tok/时</th></tr></thead>
+    <thead><tr><th>模型</th><th>调用</th><th>prompt</th><th>completion</th><th>合计</th><th>占比</th><th>积分消耗(估)</th><th>1 积分≈? token</th><th>来源拆分</th><th>首次</th><th>末次</th><th>总跨度</th><th>活跃时长</th><th>k tok/时</th></tr></thead>
     <tbody>{token_rows}</tbody>
   </table>
   </div>
